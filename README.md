@@ -1,7 +1,6 @@
-<<<<<<< HEAD
-# Cross-insight Trader
+# Cross-insight Trader: Integrating diverse investment horizon for portfolio management
 
 =======
-# multi-scale-portfolio-selection
-Cross-insight trader: Integrating diverse investment horizon for portfolio management
->>>>>>> b7ac674e57726d9f16de76fbfe2ed0d068134356
+## run the model
+python main.py --dataset HSI_50_TICKER
+

@@ -1,7 +1,7 @@
 <<<<<<< HEAD
-# Multi-agent-Fractal-portfolio-management
-Multi-agent Fractal Framework for Portfolio Management
+# Cross-insight Trader
+
 =======
 # multi-scale-portfolio-selection
-A Multi-scale Framework with Counterfactual Multi-agent Reinforcement Learning for Portfolio Selection
+Cross-insight trader: Integrating diverse investment horizon for portfolio management
 >>>>>>> b7ac674e57726d9f16de76fbfe2ed0d068134356

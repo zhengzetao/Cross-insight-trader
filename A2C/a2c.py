@@ -1,6 +1,7 @@
 from typing import Any, Dict, Optional, Type, Union, List, Tuple
 import time
 import gym
+import wandb
 import datetime
 import torch as th
 import numpy as np
@@ -9,7 +10,7 @@ from torch.nn import functional as F
 from collections import deque
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import ipdb
 # from tools.on_policy_algorigthms import OnPolicyAlgorithm
 from A2C.policy import ActorCriticPolicy
 from preprocessor.preprocessors import series_decomposition
@@ -72,7 +73,7 @@ class A2C():
         learning_rate: Union[float, Schedule] = 7e-4,
         agent_num: int = 4,
         max_level: int=3,
-        n_steps: int = 5,
+        n_steps: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 1.0,
         ent_coef: float = 0.0,
@@ -175,12 +176,12 @@ class A2C():
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
             if self._last_episode_starts == 1:
-                self.last_action = th.zeros((self.agent_num, self.action_space.shape[0]))  #the agent input considers the last step action
+                self.last_action = th.zeros((self.agent_num+1, self.action_space.shape[0]))  #the agent input considers the last step action
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
-                actions = th.zeros([self.agent_num, self.action_space.shape[0]])
-                action_mean = th.zeros([self.agent_num, self.action_space.shape[0]])
-                log_probs = th.zeros([self.agent_num, 1])
+                actions = th.zeros([self.agent_num+1, self.action_space.shape[0]]) # add a position for cross-insight policy
+                action_mean = th.zeros([self.agent_num+1, self.action_space.shape[0]])
+                log_probs = th.zeros([self.agent_num+1, 1])
                 agent_oh = th.eye(self.agent_num)
                 multi_obs = series_decomposition(self._last_state[0], self.max_level)   #multi_obs.shape=[4, 30, 252]
                 obs_tensor = obs_as_tensor(multi_obs, self.device)
@@ -193,12 +194,17 @@ class A2C():
                     actions[agent_id] = action
                     action_mean[agent_id] = mu
                     self.last_action[agent_id] = action     #update the last actions array
-            
+                # using a cross-insight policy (meta-policy) to make decision rather than element-wise add
+                action, log_prob, mu = self.policy.meta_forward(obs_as_tensor(self._last_state, self.device), actions[:-1])
+                log_probs[-1] = log_prob
+                actions[-1] = action
+                action_mean[-1] = 0
+                self.last_action[-1] = action
                 '''
                   Critic receive the state, obs, and actions from all agents as input
                 '''
                 critic_input_latent, critic_cf_input_latent = self.policy.get_critic_input(actions.to(self.device), obs_tensor, state_tensor.t(), action_mean)
-                values = self.policy.value_net(critic_input_latent)  # values.shape=[agent_num, 1]
+                values = self.policy.value_net(critic_input_latent)  # values.shape=[agent_num+1, 1]
                 values_baseline = self.policy.value_net(critic_cf_input_latent)
 
 
@@ -207,7 +213,8 @@ class A2C():
               so we need to further process the actions from multi-agents, the most easier way is mean the actions from multi-agents.
             '''
             actions = actions.cpu().numpy()
-            joint_actions = np.mean(actions, axis=0)
+            # joint_actions = np.mean(actions, axis=0) #using element-wise add to generate joint action
+            joint_actions = actions[-1]  #using the cross-insight policy to genetrate joint action
 
             # Rescale and perform action
             clipped_actions = joint_actions
@@ -236,14 +243,15 @@ class A2C():
 
         with th.no_grad():
             # Compute value for the last timestep
-            last_timestep_action = th.zeros([self.agent_num, self.action_space.shape[0]])
-            last_timestep_action_mean = th.zeros([self.agent_num, self.action_space.shape[0]])
+            last_timestep_action = th.zeros([self.agent_num+1, self.action_space.shape[0]]) # 1 is the cross-insight policy
+            last_timestep_action_mean = th.zeros([self.agent_num+1, self.action_space.shape[0]])
             multi_obs = series_decomposition(self._last_state[0], self.max_level)
             obs_tensor = obs_as_tensor(multi_obs, self.device)
+            ipdb.set_trace()
             state_tensor = obs_as_tensor(self._last_state[0], self.device)
             critic_last_input_latent, critic_last_cf_input_latent = self.policy.get_critic_input(last_timestep_action.to(self.device), \
                                                                                         obs_tensor, state_tensor.t(), last_timestep_action_mean)
-            values = self.policy.value_net(critic_last_input_latent)  # values.shape=[agent_num, 1]
+            values = self.policy.value_net(critic_last_input_latent)  # values.shape=[agent_num+1, 1]
             
             # obs_tensor = obs_as_tensor(new_state, self.device)
             # _, values, _ = self.policy.forward(obs_tensor)
@@ -264,6 +272,7 @@ class A2C():
         self._update_learning_rate(self.policy.optimizer)
 
         # This will only loop once (get all data in one go)
+        losses, policy_losses, value_losses = [], [], []
         for rollout_data in self.rollout_buffer.get(batch_size=None):
 
             actions = rollout_data.actions
@@ -288,8 +297,8 @@ class A2C():
                 log_probs[transistion_id] = log_prob
                 entropys[transistion_id] = entropy
             # Z-Score Normalize advantage (not present in the original implementation)
-            # advantages = rollout_data.advantages
-            advantages = rollout_data.co_adv
+            advantages = rollout_data.advantages
+            # advantages = rollout_data.co_adv
             if self.normalize_advantage:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -307,7 +316,11 @@ class A2C():
             else:
                 entropy_loss = -th.mean(entropy)
 
-            loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+            loss = policy_loss  + self.vf_coef * value_loss# + self.ent_coef * entropy_loss
+
+            policy_losses.append(policy_loss.item())
+            value_losses.append(value_loss.item())
+            losses.append(loss.item())
 
             # Optimization step
             self.policy.optimizer.zero_grad()
@@ -320,15 +333,20 @@ class A2C():
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
         # explained_var = explained_variance(self.rollout_buffer.values.sum(2).flatten(), self.rollout_buffer.returns.flatten())
 
-
         self._n_updates += 1
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/explained_variance", explained_var)
-        self.logger.record("train/entropy_loss", entropy_loss.item())
+        # self.logger.record("train/explained_variance", explained_var)
+        # self.logger.record("train/entropy_loss", entropy_loss.item())
         self.logger.record("train/policy_loss", policy_loss.item())
         self.logger.record("train/value_loss", value_loss.item())
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+        wandb.log(
+            {"policy_loss": np.mean(policy_losses),
+            "value_loss": np.mean(value_losses),
+            "final loss": np.mean(losses),
+            },
+            step=self._n_updates)
 
     def learn(self, total_timesteps: int, log_interval: int = 100, eval_env: Optional[GymEnv] = None, eval_freq: int = -1,
         n_eval_episodes: int = 5, tb_log_name: str = "A2C", eval_log_path: Optional[str] = None, reset_num_timesteps: bool = True) -> "A2C":
@@ -404,6 +422,15 @@ class A2C():
             **self.policy_kwargs  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
+
+        wandb.init(config={
+            "learning_rate": 0.0002,
+            "architecture": "TCN-SA",
+            "dataset": "indtrack1",
+            "epochs": 100000,
+            },
+            project="portfolio-opt",
+            name="indtrack1:test1")
 
     def set_random_seed(self, seed: Optional[int] = None) -> None:
         """

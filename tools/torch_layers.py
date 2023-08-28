@@ -1,10 +1,12 @@
 from itertools import zip_longest
 from typing import Dict, List, Tuple, Type, Union, Optional
-
+import ipdb
 import gym
 import torch as th
 from torch import nn
 import torch.nn.functional as f
+from torch.nn.utils import weight_norm
+import torch.nn.init as init
 
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
 from stable_baselines3.common.type_aliases import TensorDict
@@ -131,7 +133,7 @@ def create_mlp(
         modules.append(nn.Linear(last_layer_dim, output_dim))
     if squash_output:
         modules.append(nn.Tanh())
-    return modules
+    return nn.Sequential(*modules)
 
 class RNN(nn.Module):
     # Because all the agents share the same network, input_shape=obs_shape+n_actions+n_agents
@@ -139,7 +141,7 @@ class RNN(nn.Module):
         super(RNN, self).__init__()
         self.hidden_dim = hidden_dim
         self.input_shape = input_shape
-        self.num_layers = 2
+        self.num_layers = 1
 
         # self.fc1 = nn.Linear(self.input_shape, self.hidden_dim)
         self.rnn = nn.GRU(self.input_shape, self.hidden_dim, num_layers=self.num_layers, batch_first=True) #
@@ -152,6 +154,143 @@ class RNN(nn.Module):
         # h_in = hidden_state.reshape(-1, self.hidden_dim)
         output, h1 = self.rnn(obs, hidden_state.cuda())
         return output
+
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        """
+        其实这就是一个裁剪的模块，裁剪多出来的padding
+        """
+        return x[:, :, :-self.chomp_size].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        """
+        相当于一个Residual block
+
+        :param n_inputs: int, 输入通道数
+        :param n_outputs: int, 输出通道数
+        :param kernel_size: int, 卷积核尺寸
+        :param stride: int, 步长，一般为1
+        :param dilation: int, 膨胀系数
+        :param padding: int, 填充系数
+        :param dropout: float, dropout比率
+        """
+        super(TemporalBlock, self).__init__()
+        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        # 经过conv1，输出的size其实是(Batch, input_channel, seq_len + padding)
+        self.chomp1 = Chomp1d(padding)  # 裁剪掉多出来的padding部分，维持输出时间步为seq_len
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        self.chomp2 = Chomp1d(padding)  #  裁剪掉多出来的padding部分，维持输出时间步为seq_len
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        """
+        参数初始化
+
+        :return:
+        """
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        """
+        :param x: size of (Batch, input_channel, seq_len)
+        :return:
+        """
+        out = self.net(x)
+
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        """
+        TCN，目前paper给出的TCN结构很好的支持每个时刻为一个数的情况，即sequence结构，
+        对于每个时刻为一个向量这种一维结构，勉强可以把向量拆成若干该时刻的输入通道，
+        对于每个时刻为一个矩阵或更高维图像的情况，就不太好办。
+
+        :param num_inputs: int， 输入通道数
+        :param num_channels: list，每层的hidden_channel数，例如[25,25,25,25]表示有4个隐层，每层hidden_channel数为25
+        :param kernel_size: int, 卷积核尺寸
+        :param dropout: float, drop_out比率
+        """
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i   # 膨胀系数：1，2，4，8……
+            in_channels = num_inputs if i == 0 else num_channels[i-1]  # 确定每一层的输入通道数
+            out_channels = num_channels[i]  # 确定每一层的输出通道数
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
+                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        输入x的结构不同于RNN，一般RNN的size为(Batch, seq_len, channels)或者(seq_len, Batch, channels)，
+        这里把seq_len放在channels后面，把所有时间步的数据拼起来，当做Conv1d的输入尺寸，实现卷积跨时间步的操作，
+        很巧妙的设计。
+        
+        :param x: size of (Batch, input_channel, seq_len)
+        :return: size of (Batch, output_channel, seq_len)
+        """
+        return self.network(x)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, n_stocks, in_features, time_steps):
+        super(SpatialAttention, self).__init__()
+        self.n_stocks = n_stocks
+        self.in_features = in_features
+        self.time_steps = time_steps
+        
+        self.w1 = nn.Linear(self.time_steps, 1, bias=False)
+        self.w2 = nn.Linear(self.in_features, self.time_steps, bias=False)
+        self.w3 = nn.Linear(self.in_features, 1, bias=False)
+        self.bs = nn.Parameter(th.randn((n_stocks, n_stocks)))
+        self.Vs = nn.Parameter(th.randn((n_stocks, n_stocks)))
+        self.init_weights()
+
+    def init_weights(self):
+        init.xavier_uniform_(self.w1.weight)
+        init.xavier_uniform_(self.w2.weight)
+        init.xavier_uniform_(self.w3.weight)
+        init.xavier_uniform_(self.bs)
+        init.xavier_uniform_(self.Vs)
+    
+    def forward(self, x):
+        # x: tensor of shape (n_stocks, in_features, time_steps)
+        # x = x.permute(0, 1, 3, 2) # shape (batch_size, n_stocks, time_steps, in_features)
+        tmp1 = self.w1(x.reshape(-1, self.time_steps)) # tmp1 shape (n_stocks*in_features, 1)
+        tmp2 = self.w2(tmp1.reshape(-1, self.in_features)) # shape (n_stocks, time_steps)
+        tmp3 = self.w3(x.permute(0, 2, 1).reshape(-1, self.in_features)) # shape (n_stocks * time_step, 1)
+        tmp3 = tmp3.reshape(-1, self.time_steps).T  # shape (time_steps, n_stocks)
+        tmp4 = th.matmul(tmp2.reshape(-1, self.n_stocks, self.time_steps), tmp3.reshape(-1, self.time_steps, self.n_stocks)).reshape(-1, self.n_stocks, self.n_stocks) # shape (n_stocks, n_stocks)
+        # tmp2 = tmp2.view(-1, self.n_stocks, self.out_features) # shape (batch_size, n_stocks, out_features)
+        # tmp3 = torch.matmul(self.w3(tmp2), self.Vs.T) # shape (batch_size, 1, n_stocks)
+        S = f.sigmoid(tmp4 + self.bs) * self.Vs # shape (batch_size, n_stocks, n_stocks)
+        S_normalized = f.softmax(S, dim=2) # normalize by rows
+        return S_normalized
 
 
 class MlpExtractor(nn.Module):

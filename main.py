@@ -6,6 +6,8 @@ from argparse import ArgumentParser
 import datetime
 
 import config
+import warnings
+warnings.filterwarnings("ignore")
 
 
 def build_parser():
@@ -17,7 +19,7 @@ def build_parser():
         metavar="MODE",
         default="train",
     )
-    parser.add_argument('--dataset',default='HSI_50_TICKER', help="DOW_30_TICKER,HSI_50_TICKER,SSE_50_TICKER")
+    parser.add_argument('--dataset',default='HSI_50_TICKER', help="DOW_30_TICKER,HSI_50_TICKER,SSE_50_TICKER,NAS_100_TICKER")
     return parser
 
 

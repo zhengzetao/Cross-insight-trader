@@ -3,7 +3,9 @@ import pandas as pd
 import numpy as np
 import torch as th
 import time
+import wandb
 import gym
+import ipdb
 
 
 import config
@@ -51,18 +53,38 @@ class DRLAgent:
     @staticmethod
     def DRL_prediction(model, environment):
         test_env, test_state = environment.get_sb_env()
+        def softmax_normalization(actions):
+            numerator = np.exp(actions)
+            denominator = np.sum(np.exp(actions))
+            softmax_output = numerator / denominator
+            return softmax_output
         """make a prediction"""
         account_memory = []
         actions_memory = []
         episode_start = 1
         test_env.reset()
+        fuse_action_return, action1_return, action2_return, action3_return, action4_return, action5_return = [1], [1], [1], [1], [1], [1]
         for i in range(len(environment.df.index.unique())):
             test_multi_obs = series_decomposition(test_state[0], config.MAX_LEVEL) 
             if episode_start == 1:
                 last_action = th.zeros([config.AGENT_NUM, test_state.shape[2]])
             action, agent_actions = model.predict(test_multi_obs, last_action, th.eye(config.AGENT_NUM))
-            #account_memory = test_env.env_method(method_name="save_asset_memory")
-            #actions_memory = test_env.env_method(method_name="save_action_memory")
+            # print(fuse_action_return[-1])
+            # wandb.log({
+            #     "fuse":fuse_action_return[-1],
+            #     "action1":action1_return[-1],
+            #     "action2":action2_return[-1],
+            #     "action3":action3_return[-1],
+            # })
+
+            fuse_action_return.append(fuse_action_return[-1] + np.sum(((test_state[0][-1,:] / test_state[0][-2,:]) - 1) * softmax_normalization(action)))
+            action1_return.append(action1_return[-1] + np.sum(((test_state[0][-1,:] / test_state[0][-2,:]) - 1) * softmax_normalization(agent_actions[0])))
+            action2_return.append(action2_return[-1] + np.sum(((test_state[0][-1,:] / test_state[0][-2,:]) - 1) * softmax_normalization(agent_actions[1]))) 
+            action3_return.append(action3_return[-1] + np.sum(((test_state[0][-1,:] / test_state[0][-2,:]) - 1) * softmax_normalization(agent_actions[2]))) 
+            # action4_return.append(action4_return[-1] + np.sum(((test_state[0][-1,:] / test_state[0][-2,:]) - 1) * softmax_normalization(agent_actions[3]))) 
+            # action5_return.append(action5_return[-1] + np.sum(((test_state[0][-1,:] / test_state[0][-2,:]) - 1) * softmax_normalization(agent_actions[4]))) 
+            
+
             test_state, rewards, dones, info = test_env.step(action)
             episode_start = dones
             last_action = th.from_numpy(agent_actions)
@@ -72,6 +94,11 @@ class DRLAgent:
             if dones[0]:
                 print("hit end!")
                 break
+        # wandb.log({"return lines" : wandb.plot.line_series(
+        #     xs=range(len(fuse_action_return)),
+        #     ys=[fuse_action_return,action1_return,action2_return,action3_return],
+        #     keys=["Fuse action","Agent 1","Agent 2","Agent 3"],
+        #     title="Return")})
         return account_memory[0], actions_memory[0]
 
     def __init__(self, env):

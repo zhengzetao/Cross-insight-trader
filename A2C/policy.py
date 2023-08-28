@@ -9,6 +9,7 @@ import gym
 import numpy as np
 import torch as th
 from torch import nn
+import ipdb
 
 from tools.distributions import (
     BernoulliDistribution,
@@ -28,6 +29,8 @@ from tools.torch_layers import (
     NatureCNN,
     create_mlp,
     RNN,
+    TemporalConvNet,
+    SpatialAttention,
 )
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -77,7 +80,7 @@ class ActorCriticPolicy(nn.Module):
         net_arch: Optional[List[Union[int, Dict[str, List[int]]]]] = None,
         activation_fn: Type[nn.Module] = nn.Tanh,
         ortho_init: bool = True,
-        hidden_dim: int = 16,
+        hidden_dim: int = 32,
         use_sde: bool = False,
         use_last_action: bool = True,
         log_std_init: float = 0.0,
@@ -117,7 +120,7 @@ class ActorCriticPolicy(nn.Module):
             if features_extractor_class == NatureCNN:
                 net_arch = []
             else:
-                net_arch = [dict(pi=[64, 64], vf=[64, 64])]
+                net_arch = [dict(pi=[512,128], vf=[64, 64])]
 
         self.net_arch = net_arch
         self.activation_fn = activation_fn
@@ -150,8 +153,9 @@ class ActorCriticPolicy(nn.Module):
         self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
         # Buuld RNN 
         self.RNN =RNN(input_shape=1, hidden_dim=self.hidden_dim)  # only the close price as input, so the shape is 1
-
-
+        self.TCN = TemporalConvNet(num_inputs=1, num_channels=[self.hidden_dim])
+        self.SpatialAtt = SpatialAttention(self.action_space.shape[0], self.hidden_dim, self.observation_space.shape[0])
+        self.fc1 = create_mlp(self.hidden_dim * self.observation_space.shape[0], self.hidden_dim, [128,64])
         self._build(lr_schedule)
 
     # def _get_constructor_parameters(self) -> Dict[str, Any]:
@@ -199,6 +203,14 @@ class ActorCriticPolicy(nn.Module):
 
         self.mlp_extractor = MlpExtractor(
             actor_feature_dim=self.actor_inpu_dim,
+            critic_feature_dim=self.critic_input_dim,
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+            device=self.device,
+        )
+
+        self.meta_mlp_extractor = MlpExtractor(
+            actor_feature_dim=(self.hidden_dim+self.agent_num) * self.action_space.shape[0],
             critic_feature_dim=self.critic_input_dim,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
@@ -265,7 +277,7 @@ class ActorCriticPolicy(nn.Module):
         Forward pass in all the networks (actor and critic)
 
         :param obs: Observation
-        :param deterministic: Whether to sample or use deterministic actions
+        :param last_action: actions executed at previous timestep
         :return: action, value and log probability of the action
         """
         latent_pi, latent_sde = self._get_latent(obs, last_action, agend_id)   #   obs.shape = [1, 30, 252]
@@ -281,8 +293,8 @@ class ActorCriticPolicy(nn.Module):
         Get the latent code (i.e., activations of the last layer of each network)
         for the different networks.
 
-        :param obs: Observation.shape=(agent_num, stock_num, lookback)
-        :param last_action: action execute at last time, shape=(agent_num, stock_num)
+        :param obs: Observation.shape=(1, stock_num, lookback)
+        :param last_action: action execute at last time, shape=(1, stock_num)
         :return: Latent codes
             for the actor, the value function and for gSDE function
         """
@@ -293,13 +305,84 @@ class ActorCriticPolicy(nn.Module):
         stock_num = obs.shape[1]
         lookback = obs.shape[2]
         # obs = preprocess_obs(obs, self.observation_space, normalize_images=self.normalize_images) # NO WORK!!!
-        rnn_hidden = self.RNN(obs.reshape(batch_multiply_agent*stock_num, lookback))   # rnn_hidden shape should be (stock_dim, lookback, hidden_dim)
-        rnn_hidden = rnn_hidden[:,-1,:].view(batch_multiply_agent, stock_num, self.hidden_dim)
-        features = self.features_extractor(rnn_hidden)   # only use the last time step hidden state, features.shape = [1, 1920] flatten 
+        # print(obs.reshape(batch_multiply_agent*stock_num, 1, lookback).shape)
+
+        tcn_feat = self.TCN(obs.reshape(batch_multiply_agent*stock_num, 1, lookback)) # shape: (n_stocks, fea_dim, time_step)
+        spatial_weight = self.SpatialAtt(tcn_feat)
+        spatial_tcn_feat =th.matmul(spatial_weight, tcn_feat.reshape(batch_multiply_agent,stock_num, -1)) 
+        spatial_tcn_feat = self.fc1(spatial_tcn_feat.reshape(batch_multiply_agent*stock_num,-1)) # shape:(n_stocks, self.hidden_dim)
+        spatial_tcn_feat = spatial_tcn_feat.reshape(batch_multiply_agent, stock_num, -1)
+        features = self.features_extractor(spatial_tcn_feat)
         features = th.cat([features, agend_id.cuda()],1)
         if self.use_last_action:
             features = th.cat([features, last_action.cuda()],1)   # concat the rnn_latent and last_action
-        latent_pi = self.mlp_extractor(features, None)   # laten_pi.shape = [1, 64], None in second placeholder means the actor mlp extractor
+        latent_pi = self.mlp_extractor(features, None)
+
+        # rnn_hidden = self.RNN(obs.reshape(batch_multiply_agent*stock_num, lookback))   # rnn_hidden shape should be (stock_dim, lookback, hidden_dim)
+        # rnn_hidden = rnn_hidden[:,-1,:].view(batch_multiply_agent, stock_num, self.hidden_dim)
+        # features = self.features_extractor(rnn_hidden)   # only use the last time step hidden state, features.shape = [1, 1920] flatten 
+        # features = th.cat([features, agend_id.cuda()],1)
+        # if self.use_last_action:
+        #     features = th.cat([features, last_action.cuda()],1)   # concat the rnn_latent and last_action
+        # latent_pi = self.mlp_extractor(features, None)   # laten_pi.shape = [1, 64], None in second placeholder means the actor mlp extractor
+        
+        # Features for sde
+        latent_sde = latent_pi
+        # if self.sde_features_extractor is not None:
+        #     latent_sde = self.sde_features_extractor(features)
+        return latent_pi, latent_sde
+
+    def meta_forward(self, state: th.Tensor, agent_actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param last_action: actions executed at previous timestep
+        :return: action, value and log probability of the action
+        """
+        latent_pi, latent_sde = self._get_meta_latent(state, agent_actions)   #   obs.shape = [1, 30, 252]
+        # Evaluate the values for the given observations
+        # values = self.value_net(latent_vf)
+        distribution, action_mean = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
+        actions = distribution.get_actions()
+        log_prob = distribution.log_prob(actions)
+        return actions, log_prob, action_mean
+
+    def _get_meta_latent(self, state: th.Tensor, agent_actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Get the latent code (i.e., activations of the last layer of each network)
+        for the cross-insight policy networks.
+
+        :param state: state.shape=(1, lookback, stock_num)
+        :param agent_actions: actions made by each agents, shape=(agent_num, stock_num)
+        :return: Latent codes
+            for the actor, the value function and for gSDE function
+        """
+        batch_multiply_agent = state.shape[0]
+        stock_num = state.shape[2]
+        lookback = state.shape[1]
+        # obs = preprocess_obs(obs, self.observation_space, normalize_images=self.normalize_images) # NO WORK!!!
+        # print(obs.reshape(batch_multiply_agent*stock_num, 1, lookback).shape)
+
+        tcn_feat = self.TCN(state.reshape(batch_multiply_agent*stock_num, 1, lookback)) # shape: (n_stocks, fea_dim, time_step)
+        spatial_weight = self.SpatialAtt(tcn_feat)
+        spatial_tcn_feat =th.matmul(spatial_weight, tcn_feat.reshape(batch_multiply_agent,stock_num, -1)) 
+        spatial_tcn_feat = self.fc1(spatial_tcn_feat.reshape(batch_multiply_agent*stock_num,-1)) # shape:(n_stocks, self.hidden_dim)
+        spatial_tcn_feat = spatial_tcn_feat.reshape(batch_multiply_agent, stock_num, -1)
+        features = self.features_extractor(spatial_tcn_feat)
+        features = th.cat([features, agent_actions.reshape(1,-1).cuda()],1)
+        # if self.use_last_action:
+        #     features = th.cat([features, last_action.cuda()],1)   # concat the rnn_latent and last_action
+        latent_pi = self.meta_mlp_extractor(features, None)
+
+        # rnn_hidden = self.RNN(obs.reshape(batch_multiply_agent*stock_num, lookback))   # rnn_hidden shape should be (stock_dim, lookback, hidden_dim)
+        # rnn_hidden = rnn_hidden[:,-1,:].view(batch_multiply_agent, stock_num, self.hidden_dim)
+        # features = self.features_extractor(rnn_hidden)   # only use the last time step hidden state, features.shape = [1, 1920] flatten 
+        # features = th.cat([features, agend_id.cuda()],1)
+        # if self.use_last_action:
+        #     features = th.cat([features, last_action.cuda()],1)   # concat the rnn_latent and last_action
+        # latent_pi = self.mlp_extractor(features, None)   # laten_pi.shape = [1, 64], None in second placeholder means the actor mlp extractor
+        
         # Features for sde
         latent_sde = latent_pi
         # if self.sde_features_extractor is not None:
@@ -405,7 +488,9 @@ class ActorCriticPolicy(nn.Module):
             and entropy of the action distribution.
         """
         # last_actions = th.cat((th.zeros((1, actions.shape[1])).cuda(), actions[1:]), axis=0)
-        latent_pi, latent_sde = self._get_latent(obs.permute(0,2,1), last_action, agent_oh)   #   obs.permute(0,2,1).shape = [agent_num, 30, 252]
+        latent_pi, latent_sde = self._get_latent(obs.permute(0,2,1), last_action[:-1], agent_oh)   #   obs.permute(0,2,1).shape = [agent_num, 30, 252]
+        meta_latent_pi, meta_latent_sde = self._get_meta_latent(state, actions[:-1])  # for the cross-insight policy 
+        latent_pi = th.concat((latent_pi, meta_latent_pi), 0)
         # Evaluate the values for the given observations
         distribution, action_mean = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
         # actions = distribution.get_actions(deterministic=deterministic)
@@ -526,9 +611,9 @@ class ActorCriticPolicy(nn.Module):
     def get_critic_input_shape(self) -> Tuple[int]:
         # the critic input shape equal to observation shape + state shape + action shape
         input_shape = 0
-        input_shape += self.agent_num
+        input_shape += self.agent_num + 1 # 1 is the cross-insight policy
         # all agent action
-        input_shape += self.action_space.shape[0] * self.agent_num    # stock_num * agent_num
+        input_shape += self.action_space.shape[0] * (self.agent_num+1)    # stock_num * (agent_num+1), 1 is the cross-insight policy
         input_shape += self.hidden_dim * self.action_space.shape[0] * 2  # state space + obs space
 
         return input_shape
@@ -544,15 +629,15 @@ class ActorCriticPolicy(nn.Module):
         '''
         critic_input = []
         critic_cf_input = []         # the counterfactual baseline input, replace the agents' actions with Guassian mean
-        assert actions.shape[0] == obs.shape[0], "inconsistent agent num"
+        assert actions.shape[0] == obs.shape[0]+1, "inconsistent agent num"
         agent_num = actions.shape[0]
         stock_num = obs.shape[1]
         actions = actions.view((1, -1)).repeat(agent_num, 1)  # reshape and repeat to (agent_num, 120), contains all agents actions
         guassian_mean = guassian_mean.view((1,-1)).repeat(agent_num, 1).cuda()
         # replace the agents' action with Guassian mean
-        action_mask = (1 - th.eye(self.agent_num)) # use a mask to ignore the action of agent itself, but no the other agents
+        action_mask = (1 - th.eye(agent_num)) # use a mask to ignore the action of agent itself, but no the other agents
         action_mask = action_mask.view(-1, 1).repeat(1, stock_num).view(agent_num, -1).cuda()   #shape=(agent_num, 120)
-        guassian_mask = th.eye(self.agent_num)
+        guassian_mask = th.eye(agent_num)
         guassian_mask = guassian_mask.view(-1, 1).repeat(1, stock_num).view(agent_num, -1).cuda()
         # critic_input.append(actions*action_mask) 
         critic_input.append(actions)
@@ -570,6 +655,8 @@ class ActorCriticPolicy(nn.Module):
         critic_cf_input.append(latent_state)
 
         # use GRU to extract obs representation
+        if obs.shape[0]+1 == agent_num: #pad the 0 in the end because using the cross-insight policy 
+            obs = nn.functional.pad(obs, (0, 0, 0, 0, 0, 1))
         _obs = obs.reshape((agent_num*stock_num, -1))
         obs_hidden = self.RNN(_obs)    #obs_hidden.shape=(agent_num*stock_num, 252, self.hidden_dim)
         obs_hidden = obs_hidden[:,-1,:].view((agent_num, stock_num, -1))

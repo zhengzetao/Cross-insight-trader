@@ -28,6 +28,8 @@ def train_stock_trading(dataset):
         Ticker_list = config.HSI_50_TICKER
     if dataset == 'SSE_50_TICKER':
         Ticker_list = config.SSE_50_TICKER
+    if dataset == 'NAS_100_TICKER':
+        Ticker_list = config.NAS_100_TICKER
 
     print("==============Start Fetching Data===========")
     df = YahooDownloader(
